@@ -34,13 +34,18 @@ class TrainConfig:
     # ---- 3. MODEL ARCHITECTURE CONFIGURATION ----
     cnn_manifest_path: str = r"D:\Project\AI\myLSTM\myCNN\checkpoints_ftCOCO\model_mainfest.json"
     cnn_weights_path: str = r"D:\Project\AI\myLSTM\myCNN\checkpoints_ftCOCO\ft_step00091000.pt"
-    cnn_out_channels: int = 640                                # Số kênh đầu ra của mô hình CNN feature extractor (640 theo kientruc.md)
-    cnn_spatial_size: Tuple[int, int] = (15, 15)               # Độ phân giải đặc trưng không gian (15, 15 theo kientruc.md)
-    input_dim: int = 256                                       # Kích thước vector đặc trưng x^t sau Spatial Adapter đưa vào LSTM
-    hidden_dim: int = 256                                      # Số lượng đơn vị ẩn (hidden units) trong từng khối LSTM
-    num_layers: int = 3                                        # Số lớp LSTM xếp chồng (Deep LSTM - 3 lớp)
-    num_classes: int = 2                                       # Số lượng lớp đầu ra phân loại (2: Tỉnh táo vs Buồn ngủ)
-    dropout: float = 0.0                                       # Tỷ lệ Dropout giữa các lớp LSTM
+    cnn_neck_channels: Tuple[int, int, int] = (224, 448, 640)     # Kênh thực tế của (p3, p4, p5) từ PAFPN
+    cnn_strides: Tuple[int, int, int] = (8, 16, 32)                # Strides tương ứng của (p3, p4, p5)
+    cnn_num_features: int = 3                                      # Số lượng tầng đặc trưng đầu vào (p3, p4, p5)
+    cnn_out_channels: int = 1312                                   # Tổng số kênh khi ghép nối (224 + 448 + 640 = 1312)
+    cnn_spatial_size: Tuple[int, int] = (15, 15)                   # Độ phân giải đặc trưng không gian tầng sâu nhất p5
+    spatial_fusion: str = "concat"                                 # Phương thức kết hợp: 'concat' | 'conv' | 'attention' | 'sum' | 'mean'
+    adapter_dropout: float = 0.1                                   # Tỷ lệ Dropout sau Spatial Feature Adapter
+    input_dim: int = 256                                           # Kích thước vector đặc trưng x^t sau Spatial Adapter đưa vào LSTM
+    hidden_dim: int = 256                                          # Số lượng đơn vị ẩn (hidden units) trong từng khối LSTM
+    num_layers: int = 3                                            # Số lớp LSTM xếp chồng (Deep LSTM - 3 lớp)
+    num_classes: int = 2                                           # Số lượng lớp đầu ra phân loại (2: Tỉnh táo vs Buồn ngủ)
+    dropout: float = 0.2                                           # Tỷ lệ Dropout giữa các lớp LSTM
 
     # ---- 4. LOSS CONFIGURATION ----
     loss_type: str = "bce"                                     # Loại loss: "bce" (DrowsinessBCELoss)
@@ -130,6 +135,10 @@ class TrainConfig:
             data["image_size"] = tuple(data["image_size"])
         if "video_exts" in data and isinstance(data["video_exts"], list):
             data["video_exts"] = tuple(data["video_exts"])
+        if "cnn_neck_channels" in data and isinstance(data["cnn_neck_channels"], list):
+            data["cnn_neck_channels"] = tuple(data["cnn_neck_channels"])
+        if "cnn_strides" in data and isinstance(data["cnn_strides"], list):
+            data["cnn_strides"] = tuple(data["cnn_strides"])
         if "cnn_spatial_size" in data and isinstance(data["cnn_spatial_size"], list):
             data["cnn_spatial_size"] = tuple(data["cnn_spatial_size"])
         if "betas" in data and isinstance(data["betas"], list):

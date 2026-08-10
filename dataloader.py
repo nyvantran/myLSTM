@@ -48,8 +48,8 @@ class CNNCollateFn:
     """
     Collate function tùy chỉnh cho DataLoader.
     Nhận batch các mẫu (video_tensor, label) từ MyLSTMDataset, gom các khung hình
-    và cho chạy qua backbone + neck của NMSFreeDetector để trích xuất feature map 5D
-    kích thước [Batch, Seq_Len, 640, 15, 15] mà vẫn giữ nguyên thứ tự chuỗi dữ liệu.
+    và cho chạy qua backbone + neck của NMSFreeDetector để trích xuất feature maps đa mức (p3, p4, p5)
+    dạng 6D kích thước [Batch, Seq_Len, 3, 640, 15, 15] mà vẫn giữ nguyên thứ tự chuỗi dữ liệu.
     """
 
     def __init__(self, cnn_model: Optional[NMSFreeDetector] = None, device: str = "cpu"):
@@ -76,13 +76,14 @@ class CNNCollateFn:
         with torch.no_grad():
             p3, p4, p5 = self.cnn_model.backbone(x_flat)
             p3, p4, p5 = self.cnn_model.neck(p3, p4, p5)
-            # p5 có dạng: [B * T, 640, H_feat, W_feat]
+            # p3: [B*T, 224, 60, 60], p4: [B*T, 448, 30, 30], p5: [B*T, 640, 15, 15]
 
-        # 3. Reshape p5 về dạng tensor 5D [B, T, 640, H_feat, W_feat] giữ nguyên thứ tự ban đầu
-        c_feat, h_feat, w_feat = p5.shape[1], p5.shape[2], p5.shape[3]
-        features_5d = p5.view(b, t, c_feat, h_feat, w_feat).cpu()
+        # 3. Reshape từng tầng đặc trưng về chuỗi 5D và đưa về CPU
+        p3_5d = p3.view(b, t, *p3.shape[1:]).cpu()
+        p4_5d = p4.view(b, t, *p4.shape[1:]).cpu()
+        p5_5d = p5.view(b, t, *p5.shape[1:]).cpu()
 
-        return features_5d, labels
+        return (p3_5d, p4_5d, p5_5d), labels
 
 
 def get_dataloaders(
@@ -187,12 +188,18 @@ if __name__ == "__main__":
 
     elapsed_time = time.perf_counter() - start_time
 
-    batch_size, seq_len = features.shape[0], features.shape[1]
+    if isinstance(features, (tuple, list)):
+        batch_size, seq_len = features[0].shape[0], features[0].shape[1]
+        shape_info = [list(f.shape) for f in features]
+        print(f"-> Kích thước batch đặc trưng đa tầng (p3, p4, p5): {shape_info}")
+    else:
+        batch_size, seq_len = features.shape[0], features.shape[1]
+        print(f"-> Kích thước batch đặc trưng: {list(features.shape)}")
+
     total_frames = batch_size * seq_len
     fps = total_frames / elapsed_time if elapsed_time > 0 else 0.0
     ms_per_frame = (elapsed_time * 1000) / total_frames if total_frames > 0 else 0.0
 
-    print(f"-> Kích thước batch đặc trưng (Features 5D) [B, T, C, H, W]: {list(features.shape)}")
     print(f"-> Kích thước batch nhãn (Labels) [B]: {list(labels.shape)}")
     print(f"-> Nhãn thực tế: {labels.tolist()}")
     print("-" * 60)

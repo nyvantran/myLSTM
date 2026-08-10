@@ -135,11 +135,14 @@ class FinalModel(nn.Module):
         print(f"p3 shape: ")
         p3, p4, p5 = self.cnn.neck(p3, p4, p5)
 
-        # Nhánh 1 neck và head
+        # Nhánh 1: neck và head (Detection)
         # results_cnn = self.head([p3, p4, p5])
-        # Nhánh 2 lsmt
-        p5_restored = p5.reshape(bs, sl, 640, 15, 15)
-        results_lstm = self.lstm(p5_restored)
+
+        # Nhánh 2: Deep LSTM Classifier
+        p3_5d = p3.view(bs, sl, *p3.shape[1:])
+        p4_5d = p4.view(bs, sl, *p4.shape[1:])
+        p5_5d = p5.view(bs, sl, *p5.shape[1:])
+        results_lstm = self.lstm((p3_5d, p4_5d, p5_5d))
         return results_lstm
         # results = results_cnn * self.alpha + results_lstm * self.beta
         # return results

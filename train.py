@@ -230,7 +230,10 @@ class TrainLstm:
 
         for batch_idx, (features, targets) in pbar:
             self.global_step += 1
-            features = features.to(self.device)
+            if isinstance(features, (tuple, list)):
+                features = tuple(f.to(self.device) for f in features)
+            else:
+                features = features.to(self.device)
             targets = targets.to(self.device)
 
             self.optimizer.zero_grad()
@@ -282,7 +285,10 @@ class TrainLstm:
 
         with torch.no_grad():
             for batch_idx, (features, targets) in pbar:
-                features = features.to(self.device)
+                if isinstance(features, (tuple, list)):
+                    features = tuple(f.to(self.device) for f in features)
+                else:
+                    features = features.to(self.device)
                 targets = targets.to(self.device)
 
                 preds = self.model(features)
