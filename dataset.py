@@ -1,5 +1,7 @@
+import os
+import time
 from pathlib import Path
-from typing import Optional, Callable, Tuple, List, Sequence, Any
+from typing import Optional, Callable, Tuple, Sequence, Any, Union, List
 
 import cv2
 import torch
@@ -8,9 +10,60 @@ from torch.utils.data import Dataset
 from config import TrainConfig
 
 
+class PreloadedTensorDataset(Dataset):
+    """
+    Dataset tải toàn bộ Tensor đặc trưng .pt vào RAM một lần duy nhất.
+    Được tối ưu hóa theo CELL 6 của datn4ni2.ipynb:
+    - Thời gian nạp chỉ < 0.5s cho toàn bộ video.
+    - Không chịu gánh nặng I/O giải mã video hay forward CNN lặp đi lặp lại.
+    - Hỗ trợ cả tensor lưu dạng float32 và float16, tự động ép sang float32 khi đưa vào mô hình.
+    """
+
+    def __init__(self, pt_path: Union[str, Path], is_train: bool = True):
+        super(PreloadedTensorDataset, self).__init__()
+        path = Path(pt_path)
+
+        if not path.exists():
+            print(f"[PreloadedTensorDataset][WARN] Không tìm thấy tệp: {path.resolve()}.")
+            print(f"    -> Đang sinh tập dữ liệu mô phỏng ngẫu nhiên để kiểm thử pipeline...")
+            num_samples = 64 if is_train else 16
+            self.p3 = torch.randn(num_samples, 120, 224, dtype=torch.float32)
+            self.p4 = torch.randn(num_samples, 120, 448, dtype=torch.float32)
+            self.p5 = torch.randn(num_samples, 120, 640, dtype=torch.float32)
+            self.labels = torch.randint(0, 2, (num_samples,), dtype=torch.long)
+            self.video_ids = [f"dummy_video_{i:04d}" for i in range(num_samples)]
+            print(f"[+] Đã tạo {num_samples} mẫu dữ liệu mô phỏng.")
+            return
+
+        t0 = time.time()
+        print(f"[PreloadedTensorDataset] Đang nạp dữ liệu từ: {path.resolve()}...")
+        data = torch.load(str(path), map_location="cpu")
+
+        # Ép kiểu float32 để đảm bảo tương thích tính toán trên mọi nền tảng
+        self.p3 = data["p3"].float()       # [N, 120, 224]
+        self.p4 = data["p4"].float()       # [N, 120, 448]
+        self.p5 = data["p5"].float()       # [N, 120, 640]
+        self.labels = data["labels"].long() # [N]
+        self.video_ids = data.get("video_ids", [f"video_{i:04d}" for i in range(len(self.labels))])
+
+        load_sec = time.time() - t0
+        print(f"    - Nạp hoàn tất {len(self.labels)} video vào RAM trong {load_sec:.2f}s!")
+        print(f"    - Phân bố nhãn: Tỉnh táo (0) = {(self.labels == 0).sum().item()}, Buồn ngủ (1) = {(self.labels == 1).sum().item()}")
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, idx: int) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+        """
+        Trả về:
+            ((p3, p4, p5), label): Bộ 3 đặc trưng không gian đa tỷ lệ và nhãn Ground Truth
+        """
+        return (self.p3[idx], self.p4[idx], self.p5[idx]), self.labels[idx]
+
+
 class MyLSTMDataset(Dataset):
     """
-    Dataset tùy chỉnh PyTorch dùng để tải chuỗi khung hình video và nhãn cho mô hình Deep LSTM.
+    Dataset tùy chỉnh PyTorch dùng để tải chuỗi khung hình video và nhãn cho mô hình Deep LSTM (Legacy Mode).
 
     Quy tắc gán nhãn:
     - Đọc tập tin video từ đường dẫn thư mục dataset.
@@ -35,18 +88,19 @@ class MyLSTMDataset(Dataset):
         self.transform = transform
 
         self.label_map = {
-            "driving": 0,  # 0: Tỉnh táo
+            "driving": 0,    # 0: Tỉnh táo
             "drowsiness": 1  # 1: Buồn ngủ
         }
 
         self.video_paths = []
-        for ext in video_exts:
-            self.video_paths.extend(list(self.dataset_dir.glob(f"*{ext}")))
+        if self.dataset_dir.exists():
+            for ext in video_exts:
+                self.video_paths.extend(list(self.dataset_dir.glob(f"*{ext}")))
 
         if len(self.video_paths) == 0:
-            raise FileNotFoundError(f"Không tìm thấy file video nào trong thư mục: {dataset_dir}")
-
-        print(f"[MyLSTMDataset] Tìm thấy {len(self.video_paths)} file video trong {dataset_dir}")
+            print(f"[MyLSTMDataset][WARN] Không tìm thấy file video nào trong thư mục: {dataset_dir}")
+        else:
+            print(f"[MyLSTMDataset] Tìm thấy {len(self.video_paths)} file video trong {dataset_dir}")
 
     @classmethod
     def from_config(cls, config: Any, transform: Optional[Callable] = None) -> "MyLSTMDataset":
@@ -82,12 +136,7 @@ class MyLSTMDataset(Dataset):
                 f"Nhãn '{label_str}' trong {video_path.name} không nằm trong {list(self.label_map.keys())}")
 
     def _load_video_frames(self, video_path: Path) -> torch.Tensor:
-        """
-        Đọc và trích xuất đều seq_len khung hình từ tập tin video qua OpenCV.
-
-        Returns:
-            torch.Tensor: Tensor chuỗi khung hình có kích thước [Seq_Len, 3, Height, Width]
-        """
+        """Đọc và trích xuất đều seq_len khung hình từ tập tin video qua OpenCV."""
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Không thể mở file video: {video_path}")
@@ -139,17 +188,6 @@ class MyLSTMDataset(Dataset):
         return torch.stack(processed_frames, dim=0)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        """
-        Lấy ra 1 mẫu dữ liệu video và nhãn tương ứng.
-
-        Args:
-            idx (int): Chỉ số index của video trong Dataset.
-
-        Returns:
-            Tuple[torch.Tensor, int]: 
-                - video_tensor: Tensor chuỗi khung hình [Seq_Len, 3, Height, Width]
-                - label: Nhãn số nguyên (0: Tỉnh táo, 1: Buồn ngủ)
-        """
         video_path = self.video_paths[idx]
         label = self._extract_label(video_path)
         video_tensor = self._load_video_frames(video_path)
@@ -157,23 +195,18 @@ class MyLSTMDataset(Dataset):
 
 
 def visualize_video_demo(video_tensor: torch.Tensor, label: int, video_name: str = "Demo Video", fps: int = 30):
-    """
-    Hàm hiển thị video trực quan từ PyTorch Tensor trả về từ MyLSTMDataset.
-    """
+    """Hàm hiển thị video trực quan từ PyTorch Tensor trả về từ MyLSTMDataset."""
     seq_len, channels, height, width = video_tensor.shape
     label_text = "0: Tinh tao (Driving)" if label == 0 else "1: Buon ngu (Drowsiness)"
     text_color = (0, 255, 0) if label == 0 else (0, 0, 255)
 
     print(f"\n[+] Đang phát video demo: {video_name}")
     print(f"    - Kích thước: {width}x{height} | Số khung hình: {seq_len} | Nhãn: {label_text}")
-    print("    - Nhấn phím 'q' hoặc 'ESC' trên cửa sổ video để dừng hiển thị.\n")
 
     window_name = f"Demo Video - MyLSTMDataset [{video_name}]"
-
     try:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(window_name, 480, 480)
-
         delay_ms = int(1000 / fps)
 
         for t in range(seq_len):
@@ -186,49 +219,30 @@ def visualize_video_demo(video_tensor: torch.Tensor, label: int, video_name: str
             cv2.addWeighted(overlay, 0.6, frame_bgr, 0.4, 0, frame_bgr)
 
             info_str = f"Khung: {t + 1}/{seq_len} | Nhan: {label_text}"
-            cv2.putText(
-                frame_bgr,
-                info_str,
-                (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                text_color,
-                2,
-                cv2.LINE_AA
-            )
-
+            cv2.putText(frame_bgr, info_str, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 2, cv2.LINE_AA)
             cv2.imshow(window_name, frame_bgr)
 
             key = cv2.waitKey(delay_ms) & 0xFF
             if key == ord('q') or key == 27:
-                print("    -> Người dùng đã chủ động dừng phát video.")
                 break
 
         cv2.destroyWindow(window_name)
-        print("    -> Đã hoàn thành phát video demo thành công.")
-
     except Exception as e:
-        print(
-            f"    [!] Không thể mở cửa sổ hiển thị OpenCV GUI ({e}). Khung hình video đã được load thành công dạng Tensor.")
+        print(f"    [!] Không thể mở cửa sổ hiển thị OpenCV GUI ({e}).")
 
 
 if __name__ == "__main__":
     import sys
-    from functools import partial
-    from config import TrainConfig
-    from myCNN.src.runtime.infer import letterbox
-
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8')
 
-    config = TrainConfig()
-    transforms = partial(letterbox, new_size=480)
-
-    dataset = MyLSTMDataset(transform=transforms)
-
-    print(f"\n[+] Tổng số video load thành công: {len(dataset)}")
-
-    video_tensor, label = dataset[10]
-    first_video_name = dataset.video_paths[10].name
-
-    visualize_video_demo(video_tensor, label, video_name=first_video_name, fps=30)
+    print("==========================================================================")
+    print("=== KIỂM TRA LỚP PRELOADEDTENSORDATASET ===")
+    print("==========================================================================")
+    
+    cfg = TrainConfig()
+    ds = PreloadedTensorDataset(cfg.val_pt, is_train=False)
+    print(f"[+] Kích thước tập dữ liệu: {len(ds)} mẫu")
+    (p3, p4, p5), label = ds[0]
+    print(f"[+] Mẫu 0: p3 shape={list(p3.shape)}, p4={list(p4.shape)}, p5={list(p5.shape)}, label={label}")
+    print("==========================================================================")

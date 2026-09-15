@@ -1,3 +1,8 @@
 /__pycache__
-/myCNN
+/outsrc
 /runs
+/evaluation_results
+/evaluation_results1
+/extracted_features_pt
+/extracted_test_features_pt
+/lstm_experiment_results

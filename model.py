@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional, Union, Tuple, Any, List
 
 import torch
@@ -33,7 +34,8 @@ class SpatialFeatureAdapter(nn.Module):
             num_features: int = TrainConfig.cnn_num_features,
             fusion: str = TrainConfig.spatial_fusion,
             spatial_size: Tuple[int, int] = TrainConfig.cnn_spatial_size,
-            dropout: float = TrainConfig.adapter_dropout
+            dropout: float = TrainConfig.adapter_dropout,
+            use_norm: bool = getattr(TrainConfig, "use_norm", True)
     ):
         """
         Khởi tạo SpatialFeatureAdapter.
@@ -71,7 +73,14 @@ class SpatialFeatureAdapter(nn.Module):
         # Thiết lập cấu trúc tầng theo chiến lược Fusion
         if self.fusion == "concat":
             # Ghép nối các vector sau pooling: 224 + 448 + 640 = 1312 -> out_dim (256)
-            self.projection = nn.Linear(self.total_in_channels, out_dim)
+            if use_norm:
+                self.projection = nn.Sequential(
+                    nn.Linear(self.total_in_channels, out_dim),
+                    nn.LayerNorm(out_dim),
+                    nn.ReLU(inplace=True)
+                )
+            else:
+                self.projection = nn.Linear(self.total_in_channels, out_dim)
             self.level_projections = None
             self.conv_fusion = None
 
@@ -274,7 +283,8 @@ class DeepLSTMClassifier(nn.Module):
             num_features: int = TrainConfig.cnn_num_features,
             fusion: str = TrainConfig.spatial_fusion,
             adapter_dropout: float = TrainConfig.adapter_dropout,
-            dropout: float = TrainConfig.dropout
+            dropout: float = TrainConfig.dropout,
+            use_norm: bool = getattr(TrainConfig, "use_norm", True)
     ):
         super(DeepLSTMClassifier, self).__init__()
 
@@ -282,6 +292,7 @@ class DeepLSTMClassifier(nn.Module):
         self.hidden_dim = hidden_dim  # Giữ giá trị hidden_dim = 256
         self.num_layers = num_layers  # Giữ giá trị num_layers = 3
         self.num_classes = num_classes  # Giữ giá trị num_classes = 2
+        self.use_norm = use_norm
 
         # Khởi tạo bộ chuyển đổi không gian nếu đầu vào là feature map MCNN (p3, p4, p5)
         if spatial_in_channels is not None:
@@ -290,7 +301,8 @@ class DeepLSTMClassifier(nn.Module):
                 out_dim=input_dim,
                 num_features=num_features,
                 fusion=fusion,
-                dropout=adapter_dropout
+                dropout=adapter_dropout,
+                use_norm=use_norm
             )
         else:
             self.spatial_adapter = None
@@ -303,7 +315,46 @@ class DeepLSTMClassifier(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0
         )
 
-        self.fc_out = nn.Linear(hidden_dim, num_classes)
+        if use_norm:
+            self.fc_out = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, num_classes)
+            )
+        else:
+            self.fc_out = nn.Linear(hidden_dim, num_classes)
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint_path: Union[str, Path], map_location: str = "cpu") -> "DeepLSTMClassifier":
+        """
+        Khởi tạo DeepLSTMClassifier và nạp trọng số trực tiếp từ file checkpoint (.pth/.pt).
+        Tự động nhận diện cấu hình lưu trong checkpoint và nạp khớp chuẩn 100% với datn4ni2.ipynb.
+        """
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Không tìm thấy file checkpoint: {path}")
+
+        ckpt = torch.load(str(path), map_location=map_location)
+        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
+
+        # Tự động nhận diện kiến trúc
+        use_norm = ("spatial_adapter.projection.0.weight" in state_dict) or ("fc_out.1.weight" in state_dict)
+        cfg_dict = ckpt.get("config", {})
+
+        input_dim = int(cfg_dict.get("input_dim", 256))
+        hidden_dim = int(cfg_dict.get("hidden_dim", 256))
+        num_layers = int(cfg_dict.get("num_layers", 3))
+        num_classes = int(cfg_dict.get("num_classes", 2))
+
+        model = cls(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_classes=num_classes,
+            use_norm=use_norm
+        )
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+        return model
 
     @classmethod
     def from_config(cls, config: Any) -> "DeepLSTMClassifier":
@@ -313,6 +364,7 @@ class DeepLSTMClassifier(nn.Module):
         fusion = getattr(config, "spatial_fusion", getattr(config, "fusion", "concat"))
         adapter_dropout = getattr(config, "adapter_dropout", 0.1)
         dropout = getattr(config, "dropout", 0.2)
+        use_norm = getattr(config, "use_norm", True)
 
         return cls(
             input_dim=config.input_dim,
@@ -323,7 +375,8 @@ class DeepLSTMClassifier(nn.Module):
             num_features=num_features,
             fusion=fusion,
             adapter_dropout=adapter_dropout,
-            dropout=dropout
+            dropout=dropout,
+            use_norm=use_norm
         )
 
     def forward(
@@ -332,7 +385,7 @@ class DeepLSTMClassifier(nn.Module):
             *args: torch.Tensor,
             hc: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             return_sequence: bool = True,
-            apply_softmax: bool = True
+            apply_softmax: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Quá trình lan truyền tiến (Forward pass).

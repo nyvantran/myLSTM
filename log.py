@@ -1,8 +1,15 @@
 import os
+import sys
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple, Sequence
 import torch
+
+# Đảm bảo console Windows hỗ trợ in UTF-8 không bị lỗi charmap
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 # Kiếm tra xem viện tensorboard đã được cài đặt chưa
 try:
@@ -43,20 +50,17 @@ class TensorBoardLogger:
         self.writer = SummaryWriter(log_dir=str(self.log_path))
         print(f"[TensorBoardLogger] Đã khởi tạo log engine tại thư mục: {self.log_path}")
 
-    def log_train_batch(self, loss: float, accuracy: float, global_step: int):
+    def log_train_batch(self, loss: float, accuracy: float, step: Optional[int] = None, global_step: Optional[int] = None):
         """
         Ghi log chỉ số Loss và Accuracy tại từng Batch huấn luyện (Batch-level).
-
-        Args:
-            loss (float): Giá trị Loss của batch hiện tại.
-            accuracy (float): Giá trị Accuracy của batch hiện tại (từ 0.0 đến 1.0).
-            global_step (int): Bước tính toán tổng quát (step_index).
+        Hỗ trợ cả tham số step (datn4ni2.ipynb) và global_step.
         """
         if not self.enabled or self.writer is None:
             return
         
-        self.writer.add_scalar("Train/Batch_Loss", loss, global_step)
-        self.writer.add_scalar("Train/Batch_Accuracy", accuracy, global_step)
+        curr_step = step if step is not None else (global_step if global_step is not None else 0)
+        self.writer.add_scalar("Train/Batch_Loss", loss, curr_step)
+        self.writer.add_scalar("Train/Batch_Accuracy", accuracy, curr_step)
 
     def log_train_epoch(self, epoch_loss: float, epoch_acc: float, learning_rate: float, epoch: int):
         """
@@ -105,6 +109,37 @@ class TensorBoardLogger:
         for key, val in metrics.items():
             self.writer.add_scalar(f"{main_tag}/{key}", val, step)
 
+    def log_metrics(self, metrics: Dict[str, float], epoch: int):
+        """
+        Ghi nhận các chỉ số chuyên biệt: Precision, Recall, F1-Score lên TensorBoard.
+        Đồng bộ với CELL 3 của datn4ni2.ipynb.
+        """
+        self.log_custom_scalars(metrics, step=epoch, main_tag="Metrics")
+
+    def log_confusion_matrix(self, cm: Any, epoch: int, class_names: Tuple[str, str] = ("Tỉnh táo", "Buồn ngủ")):
+        """
+        Vẽ và đẩy ảnh heatmap ma trận nhầm lẫn (Confusion Matrix) lên TensorBoard.
+        Đồng bộ với CELL 3 của datn4ni2.ipynb.
+        """
+        if not self.enabled or self.writer is None:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+
+            fig, ax = plt.subplots(figsize=(5, 4))
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_names, yticklabels=class_names, ax=ax)
+            ax.set_xlabel("Dự đoán (Predicted)")
+            ax.set_ylabel("Thực tế (Actual)")
+            ax.set_title(f"Confusion Matrix (Epoch {epoch})")
+            plt.tight_layout()
+            self.writer.add_figure("Images/Confusion_Matrix", fig, epoch)
+            plt.close(fig)
+        except Exception as e:
+            print(f"[TensorBoardLogger][WARN] Không thể log confusion matrix: {e}")
+
     def log_histogram(self, tag: str, values: torch.Tensor, step: int):
         """
         Ghi log biểu đồ phân bố trọng số / gradient (Histograms).
@@ -119,13 +154,14 @@ class TensorBoardLogger:
         
         self.writer.add_histogram(tag, values, step)
 
-    def log_model_graph(self, model: torch.nn.Module, input_sample: torch.Tensor):
+    def log_model_graph(self, model: torch.nn.Module, input_sample: Any):
         """
         Ghi log luồng ma trận kiến trúc mô hình (Computational Graph).
+        Hỗ trợ cả input_sample là torch.Tensor hoặc tuple (p3, p4, p5).
 
         Args:
             model (torch.nn.Module): Mô hình PyTorch.
-            input_sample (torch.Tensor): Tensor mẫu giả lập đầu vào.
+            input_sample (Any): Tensor mẫu hoặc tuple các tensor đầu vào.
         """
         if not self.enabled or self.writer is None:
             return
@@ -134,7 +170,10 @@ class TensorBoardLogger:
             self.writer.add_graph(model, input_sample)
             print("[TensorBoardLogger] Đã lưu sơ đồ ma trận kiến trúc mô hình (Computational Graph).")
         except Exception as e:
-            print(f"[TensorBoardLogger] Không thể lưu sơ đồ kiến trúc mô hình: {e}")
+            print(f"[TensorBoardLogger][WARN] Không thể lưu sơ đồ kiến trúc mô hình: {e}")
+
+    # Alias đồng bộ với datn4ni2.ipynb
+    log_graph = log_model_graph
 
     def close(self):
         """Đóng và hoàn tất tiến trình ghi log."""

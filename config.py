@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field, asdict
 from typing import Tuple, Optional, List, Dict, Any
+import os
 import json
 from pathlib import Path
 
@@ -8,39 +9,44 @@ from pathlib import Path
 class TrainConfig:
     """
     Cấu hình toàn bộ hệ thống huấn luyện cho mô hình Deep LSTM (Drowsiness Detection).
-    Bao gồm cấu hình Dữ liệu (Dataset), Dataloader, Kiến trúc mô hình (CNN + LSTM),
-    Hàm mất mát (Loss), Bộ tối ưu hóa (Optimizer & Scheduler), Logging (TensorBoard) và Runtime.
+    Hỗ trợ 2 chế độ:
+    1. Chế độ Tensor .pt siêu tốc (Fast Preloaded Tensor Mode - Khuyến nghị & mặc định theo datn4ni2.ipynb).
+    2. Chế độ Video thô trích xuất qua CNN (Legacy Raw Video Mode).
     """
 
-    # ---- 1. DATASET CONFIGURATION ----
-    dataset_dir: str = r"D:\Project\AI\dataset\VBDDD-dataset"  # Đường dẫn tới thư mục VBDDD-dataset
-    seq_len: int = 60                                           # Số lượng khung hình cố định cho mỗi video (60 cho FI-DDD / VBDDD)
+    # ---- 1. DATASET CONFIGURATION (TENSOR .PT & RAW VIDEO) ----
+    use_preloaded_pt: bool = True                              # True: Dùng Tensor .pt đã trích xuất | False: Đọc video thô qua OpenCV
+    train_pt: str = "extracted_features_pt/features_sust_train.pt"  # Đường dẫn tệp tensor train
+    val_pt: str = "extracted_features_pt/features_sust_val.pt"      # Đường dẫn tệp tensor validation
+    dataset_dir: str = r"D:\Project\AI\dataset\SUST"           # Đường dẫn tới thư mục video thô (nếu dùng chế độ raw video)
+    seq_len: int = 120                                         # Số lượng khung hình cố định cho mỗi video (120 cho SUST dataset)
     image_size: Tuple[int, int] = (480, 480)                   # Kích thước khung hình (Height, Width)
     video_exts: Tuple[str, ...] = (".avi", ".mp4", ".mkv")      # Các định dạng video hợp lệ
     train_ratio: float = 0.8                                   # Tỷ lệ chia tập huấn luyện (80% train, 20% validation)
     split_by_subject: bool = True                              # Chia dataset theo người tham gia (Subject-independent split)
 
     # ---- 2. DATALOADER CONFIGURATION ----
-    batch_size: int = 4                                        # Kích thước batch size cho huấn luyện và đánh giá
-    num_workers: int = 0                                       # Số lượng tiến trình worker nạp dữ liệu (0 cho Windows/Debug)
+    batch_size: int = 64                                       # Kích thước batch size (64 cho tensor .pt trên GPU T4/RTX)
+    num_workers: int = 0                                       # Số lượng worker (0 là tối ưu nhất khi tensor đã nạp sẵn vào RAM)
     pin_memory: bool = True                                    # Tối ưu hóa chuyển dữ liệu lên GPU memory
     shuffle: bool = True                                       # Trộn ngẫu nhiên tập huấn luyện
-    drop_last: bool = True                                     # Bỏ qua batch cuối cùng nếu không đủ kích thước batch_size
-    persistent_workers: bool = False                           # Giữ nguyên worker giữa các epoch (yêu cầu num_workers > 0)
-    prefetch_factor: Optional[int] = None                      # Số lượng batch prefetch cho mỗi worker (yêu cầu num_workers > 0)
+    drop_last: bool = False                                    # Không bỏ rơi batch cuối cùng để đánh giá trọn vẹn tập dữ liệu
+    persistent_workers: bool = False                           # Giữ nguyên worker giữa các epoch
+    prefetch_factor: Optional[int] = None                      # Số lượng batch prefetch cho mỗi worker
     seed: int = 42                                             # Seed khởi tạo ngẫu nhiên để đảm bảo tính lặp lại (reproducibility)
-    use_dummy_cnn: bool = True                                 # Tự động trích xuất đặc trưng qua Dummy CNN trong collate_fn
+    use_dummy_cnn: bool = False                                # Tự động trích xuất đặc trưng qua Dummy CNN trong collate_fn (chỉ cho raw video)
 
     # ---- 3. MODEL ARCHITECTURE CONFIGURATION ----
-    cnn_manifest_path: str = r"D:\Project\AI\myLSTM\myCNN\checkpoints_ftCOCO\model_mainfest.json"
-    cnn_weights_path: str = r"D:\Project\AI\myLSTM\myCNN\checkpoints_ftCOCO\ft_step00091000.pt"
+    cnn_manifest_path: str = r"/outsrc/myCNN\checkpoints_ftCOCO\model_mainfest.json"
+    cnn_weights_path: str = r"/outsrc/myCNN\checkpoints_ftCOCO\ft_step00091000.pt"
     cnn_neck_channels: Tuple[int, int, int] = (224, 448, 640)     # Kênh thực tế của (p3, p4, p5) từ PAFPN
     cnn_strides: Tuple[int, int, int] = (8, 16, 32)                # Strides tương ứng của (p3, p4, p5)
     cnn_num_features: int = 3                                      # Số lượng tầng đặc trưng đầu vào (p3, p4, p5)
     cnn_out_channels: int = 1312                                   # Tổng số kênh khi ghép nối (224 + 448 + 640 = 1312)
     cnn_spatial_size: Tuple[int, int] = (15, 15)                   # Độ phân giải đặc trưng không gian tầng sâu nhất p5
-    spatial_fusion: str = "concat"                                 # Phương thức kết hợp: 'concat' | 'conv' | 'attention' | 'sum' | 'mean'
+    spatial_fusion: str = "concat"                                 # Phương thức kết hợp: 'concat' | 'sum' | 'mean'
     adapter_dropout: float = 0.1                                   # Tỷ lệ Dropout sau Spatial Feature Adapter
+    use_norm: bool = True                                          # Sử dụng LayerNorm trong Spatial Adapter và Dropout trong FC head
     input_dim: int = 256                                           # Kích thước vector đặc trưng x^t sau Spatial Adapter đưa vào LSTM
     hidden_dim: int = 256                                          # Số lượng đơn vị ẩn (hidden units) trong từng khối LSTM
     num_layers: int = 3                                            # Số lớp LSTM xếp chồng (Deep LSTM - 3 lớp)
@@ -48,15 +54,15 @@ class TrainConfig:
     dropout: float = 0.2                                           # Tỷ lệ Dropout giữa các lớp LSTM
 
     # ---- 4. LOSS CONFIGURATION ----
-    loss_type: str = "bce"                                     # Loại loss: "bce" (DrowsinessBCELoss)
-    bce_eps: float = 1e-7                                      # Hằng số epsilon kẹp giá trị tránh log(0)
+    loss_type: str = "ce"                                      # Loại loss: "ce" (CrossEntropyLoss chuẩn) hoặc "bce" (BCELoss)
+    bce_eps: float = 1e-7                                      # Hằng số epsilon kẹp giá trị tránh log(0) (nếu dùng bce)
     bce_reduction: str = "mean"                                # Cách gom nhóm loss ('mean' | 'sum' | 'none')
     pos_weight: Optional[float] = None                         # Trọng số cho lớp dương (1: Buồn ngủ) khi mất cân bằng dữ liệu
 
     # ---- 5. OPTIMIZER & SCHEDULER CONFIGURATION ----
-    epochs: int = 10                                           # Tổng số epoch huấn luyện
-    lr0: float = 1e-3                                          # Learning rate khởi tạo / sau warmup
-    lr_min_factor: float = 0.01                                # Hệ số lr tối thiểu: lr_min = lr0 * lr_min_factor
+    epochs: int = 40                                           # Tổng số epoch huấn luyện (40 epochs chỉ mất ~50s với tensor .pt)
+    lr0: float = 1e-3                                          # Learning rate khởi tạo
+    lr_min_factor: float = 0.01                                # Hệ số lr tối thiểu: lr_min = lr0 * lr_min_factor (1e-5)
     weight_decay: float = 1e-4                                 # Trọng số phạt L2 regularization
     warmup_epochs: float = 1.0                                 # Số epoch khởi động mềm (Warmup)
     optimizer: str = "adamw"                                   # Bộ tối ưu hóa: "adamw" | "adam" | "sgd"
@@ -69,22 +75,33 @@ class TrainConfig:
     # ---- 6. TENSORBOARD & LOGGING CONFIGURATION ----
     tb_log_dir: str = "runs"                                   # Thư mục lưu log cho TensorBoard
     log_dir: str = "./logs"                                    # Thư mục lưu log text (.log)
-    experiment_name: str = "lstm_drowsiness"                   # Tên bài thử nghiệm (experiment)
-    checkpoint_dir: str = "./checkpoints"                      # Thư mục lưu checkpoint mô hình (.pth)
-    save_ckpt_interval_epochs: int = 1                         # Số epoch giữa 2 lần lưu checkpoint định kỳ
+    experiment_name: str = "lstm_sust_t4"                      # Tên bài thử nghiệm (experiment)
+    checkpoint_dir: str = "lstm_experiment_results/checkpoints" # Thư mục lưu checkpoint mô hình (.pth)
+    save_ckpt_interval_epochs: int = 5                         # Số epoch giữa 2 lần lưu checkpoint định kỳ
     save_best_only: bool = False                               # True: Chỉ lưu best checkpoint | False: Lưu định kỳ + last/best
-    ckpt_keep_last: int = 3                                    # Số lượng checkpoint định kỳ giữ lại (<=0 để giữ tất cả)
+    ckpt_keep_last: int = 3                                    # Số lượng checkpoint định kỳ giữ lại
     resume: str = ""                                           # Đường dẫn file checkpoint để huấn luyện tiếp (rỗng = train từ đầu)
 
     # ---- 7. RUNTIME & HARDWARE CONFIGURATION ----
     device: str = "cuda"                                       # Thiết bị tính toán ("cuda" | "cpu")
-    amp: bool = False                                          # Bật/Tắt Tự động ép kiểu chính xác hỗn hợp (Automatic Mixed Precision)
+    amp: bool = True                                           # Bật Tự động ép kiểu chính xác hỗn hợp (Automatic Mixed Precision FP16)
     log_interval: int = 10                                     # Số step giữa các lần in log tiến trình chi tiết
     val_interval_epochs: int = 1                               # Số epoch giữa 2 lần đánh giá tập Validation
 
     def __post_init__(self):
-        """Kiểm tra tính hợp lệ của tham số cấu hình và tự động điều chỉnh nếu cần."""
-        # 1. Ràng buộc các tham số dữ liệu & dataloader
+        """Kiểm tra tính hợp lệ của tham số cấu hình và tự động điều chỉnh theo môi trường."""
+        # 1. Tự động nhận diện môi trường Kaggle
+        if os.path.exists("/kaggle"):
+            if not os.path.exists(self.train_pt):
+                kaggle_train = "/kaggle/input/datasets/nyvantran6634/sust4ni1/features_sust_train.pt"
+                kaggle_val   = "/kaggle/input/datasets/nyvantran6634/sust4ni1/features_sust_val.pt"
+                if os.path.exists(kaggle_train):
+                    self.train_pt = kaggle_train
+                    self.val_pt = kaggle_val
+            self.checkpoint_dir = "/kaggle/working/checkpoints"
+            self.tb_log_dir = "/kaggle/working/runs"
+
+        # 2. Ràng buộc các tham số dữ liệu & dataloader
         assert self.seq_len > 0, "seq_len phải > 0"
         assert self.batch_size > 0, "batch_size phải > 0"
         assert 0.0 < self.train_ratio < 1.0, "train_ratio phải nằm trong khoảng (0.0, 1.0)"
@@ -92,18 +109,14 @@ class TrainConfig:
         assert self.epochs > 0, "epochs phải > 0"
         assert self.lr0 > 0.0, "lr0 phải > 0"
 
-        # 2. Xử lý logic khi num_workers == 0
+        # 3. Xử lý logic khi num_workers == 0
         if self.num_workers == 0:
             if self.persistent_workers:
-                print("[TrainConfig][Warning] persistent_workers=True yêu cầu num_workers > 0. "
-                      "Tự động đặt lại persistent_workers=False.")
                 self.persistent_workers = False
             if self.prefetch_factor is not None:
-                print("[TrainConfig][Warning] prefetch_factor chỉ có tác dụng khi num_workers > 0. "
-                      "Tự động đặt lại prefetch_factor=None.")
                 self.prefetch_factor = None
 
-        # 3. Ràng buộc tham số mô hình
+        # 4. Ràng buộc tham số mô hình
         assert self.input_dim > 0, "input_dim phải > 0"
         assert self.hidden_dim > 0, "hidden_dim phải > 0"
         assert self.num_layers > 0, "num_layers phải > 0"
@@ -131,20 +144,9 @@ class TrainConfig:
             data = json.load(f)
 
         # Chuyển đổi list thành tuple cho các trường kiểu Tuple
-        if "image_size" in data and isinstance(data["image_size"], list):
-            data["image_size"] = tuple(data["image_size"])
-        if "video_exts" in data and isinstance(data["video_exts"], list):
-            data["video_exts"] = tuple(data["video_exts"])
-        if "cnn_neck_channels" in data and isinstance(data["cnn_neck_channels"], list):
-            data["cnn_neck_channels"] = tuple(data["cnn_neck_channels"])
-        if "cnn_strides" in data and isinstance(data["cnn_strides"], list):
-            data["cnn_strides"] = tuple(data["cnn_strides"])
-        if "cnn_spatial_size" in data and isinstance(data["cnn_spatial_size"], list):
-            data["cnn_spatial_size"] = tuple(data["cnn_spatial_size"])
-        if "betas" in data and isinstance(data["betas"], list):
-            data["betas"] = tuple(data["betas"])
+        tuple_fields = ["image_size", "video_exts", "cnn_neck_channels", "cnn_strides", "cnn_spatial_size", "betas"]
+        for fld in tuple_fields:
+            if fld in data and isinstance(data[fld], list):
+                data[fld] = tuple(data[fld])
 
         return cls(**data)
-
-
-
