@@ -21,8 +21,11 @@ import time
 import json
 import random
 import argparse
+import hashlib
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Optional
+
+from augment import DetectionAugmenter, config as DEFAULT_AUG_CONFIG
 
 # Đảm bảo console Windows hỗ trợ in UTF-8 không bị lỗi charmap
 if hasattr(sys.stdout, "reconfigure"):
@@ -130,31 +133,25 @@ class CloneONNXCUDARuntime:
 # ==============================================================================
 # 2. HÀM ĐỌC VIDEO & TRÍCH XUẤT ĐẶC TRƯNG MỖI VIDEO
 # ==============================================================================
-def extract_single_video_features(
+def read_and_sample_video_frames(
         video_path: Path,
-        runner: CloneONNXCUDARuntime,
         seq_len: int = 120,
-        img_size: int = 480,
-        chunk_size: int = 24,
-        device: str = "cuda:0"
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        img_size: int = 480
+) -> Tuple[List[np.ndarray], int]:
     """
-    Đọc nhanh video tuần tự, letterbox, forward ONNX theo chunk và pool về 1D.
-    Hỗ trợ cả định dạng .mp4, .avi, .mkv, .mov,...
+    Đọc nhanh video tuần tự, letterbox sang kích thước cố định và định dạng RGB (uint8).
     
     Returns:
-        p3_tensor: [seq_len, 224] on CPU
-        p4_tensor: [seq_len, 448] on CPU
-        p5_tensor: [seq_len, 640] on CPU
-        actual_frame_count: số khung hình thực tế trong video
+        frames_rgb: Danh sách seq_len ảnh numpy RGB uint8 [img_size, img_size, 3]
+        actual_frame_count: Số khung hình thực tế trích xuất được từ video trước khi padding
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Không thể mở video: {video_path}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
     frames = []
+
     if total_frames <= 0:
         # Dự phòng trường hợp metadata của video không trả về frame count (thường gặp ở một số file .avi)
         raw_frames = []
@@ -172,8 +169,7 @@ def extract_single_video_features(
                 if idx in indices:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     lb = letterbox(rgb, new_size=img_size)
-                    frame_tensor = torch.from_numpy(lb.transpose(2, 0, 1)).float() / 255.0
-                    frames.append(frame_tensor)
+                    frames.append(lb)
     else:
         indices = set(torch.linspace(0, max(0, total_frames - 1), seq_len).long().tolist())
         idx = 0
@@ -184,21 +180,42 @@ def extract_single_video_features(
             if idx in indices:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 lb = letterbox(rgb, new_size=img_size)
-                frame_tensor = torch.from_numpy(lb.transpose(2, 0, 1)).float() / 255.0
-                frames.append(frame_tensor)
+                frames.append(lb)
             idx += 1
         cap.release()
 
     actual_frames = len(frames)
     if actual_frames == 0:
         # Trường hợp rỗng dự phòng
-        frames = [torch.zeros(3, img_size, img_size, dtype=torch.float32) for _ in range(seq_len)]
+        frames = [np.zeros((img_size, img_size, 3), dtype=np.uint8) for _ in range(seq_len)]
     else:
         while len(frames) < seq_len:
-            frames.append(frames[-1])
+            frames.append(frames[-1].copy())
     frames = frames[:seq_len]
+    return frames, actual_frames
 
-    video_tensor = torch.stack(frames, dim=0)  # [seq_len, 3, 480, 480]
+
+def forward_video_chunks(
+        frames_rgb: List[np.ndarray],
+        runner: CloneONNXCUDARuntime,
+        chunk_size: int = 24,
+        device: str = "cuda:0"
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Forward danh sách khung hình RGB qua mô hình ONNX CUDA theo từng mini-chunk
+    kết hợp Adaptive Average Pooling (1, 1).
+    
+    Returns:
+        p3_tensor: [seq_len, 224] on CPU
+        p4_tensor: [seq_len, 448] on CPU
+        p5_tensor: [seq_len, 640] on CPU
+    """
+    seq_len = len(frames_rgb)
+    tensor_list = [
+        torch.from_numpy(np.ascontiguousarray(f.transpose(2, 0, 1))).float() / 255.0
+        for f in frames_rgb
+    ]
+    video_tensor = torch.stack(tensor_list, dim=0)  # [seq_len, 3, H, W]
 
     # Forward theo mini-chunks để tiết kiệm VRAM và tăng tốc
     p3_chunks, p4_chunks, p5_chunks = [], [], []
@@ -210,9 +227,53 @@ def extract_single_video_features(
         p4_chunks.append(F.adaptive_avg_pool2d(outs[1], (1, 1)).flatten(1).cpu())
         p5_chunks.append(F.adaptive_avg_pool2d(outs[2], (1, 1)).flatten(1).cpu())
 
-    p3_tensor = torch.cat(p3_chunks, dim=0)  # [120, 224]
-    p4_tensor = torch.cat(p4_chunks, dim=0)  # [120, 448]
-    p5_tensor = torch.cat(p5_chunks, dim=0)  # [120, 640]
+    p3_tensor = torch.cat(p3_chunks, dim=0)  # [seq_len, 224]
+    p4_tensor = torch.cat(p4_chunks, dim=0)  # [seq_len, 448]
+    p5_tensor = torch.cat(p5_chunks, dim=0)  # [seq_len, 640]
+    return p3_tensor, p4_tensor, p5_tensor
+
+
+def extract_single_video_features(
+        video_path: Path,
+        runner: CloneONNXCUDARuntime,
+        seq_len: int = 120,
+        img_size: int = 480,
+        chunk_size: int = 24,
+        device: str = "cuda:0",
+        augmenter: Optional[DetectionAugmenter] = None,
+        aug_seed: Optional[int] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """
+    Đọc nhanh video tuần tự, letterbox, tùy chọn áp dụng tăng cường dữ liệu (nếu có augmenter)
+    với seed đồng bộ thời gian cho toàn bộ video clip, forward ONNX theo chunk và pool về 1D.
+    Hỗ trợ cả định dạng .mp4, .avi, .mkv, .mov,...
+    
+    Returns:
+        p3_tensor: [seq_len, 224] on CPU
+        p4_tensor: [seq_len, 448] on CPU
+        p5_tensor: [seq_len, 640] on CPU
+        actual_frame_count: số khung hình thực tế trong video
+    """
+    frames_rgb, actual_frames = read_and_sample_video_frames(
+        video_path=video_path,
+        seq_len=seq_len,
+        img_size=img_size
+    )
+
+    if augmenter is not None:
+        frames_rgb, _, _, _ = augmenter.augment_video(
+            frames=frames_rgb,
+            boxes_list=None,
+            labels_list=None,
+            seed=aug_seed
+        )
+
+    p3_tensor, p4_tensor, p5_tensor = forward_video_chunks(
+        frames_rgb=frames_rgb,
+        runner=runner,
+        chunk_size=chunk_size,
+        device=device
+    )
 
     return p3_tensor, p4_tensor, p5_tensor, actual_frames
 
@@ -351,19 +412,47 @@ def process_split_set(
         seq_len: int = 120,
         img_size: int = 480,
         chunk_size: int = 24,
-        use_fp16: bool = False
+        use_fp16: bool = False,
+        augmenter: Optional[DetectionAugmenter] = None,
+        num_aug: int = 0,
+        include_original: bool = True,
+        base_seed: int = 42,
+        force_recompute: bool = False
 ) -> None:
     """
-    Trích xuất đặc trưng cho một phân tập (Train hoặc Val), hỗ trợ cache từng video.
+    Trích xuất đặc trưng cho một phân tập (Train hoặc Val), hỗ trợ tăng cường dữ liệu và cache từng video.
+    
+    Args:
+        split_name: Tên phân tập ("train" hoặc "val")
+        items: Danh sách bộ đôi (video_path, label)
+        runner: Đối tượng ONNX CUDA Runtime
+        output_pt_path: Đường dẫn tệp .pt đầu ra
+        cache_dir: Thư mục lưu cache các video đã trích xuất
+        seq_len: Số khung hình chuẩn hóa mỗi video
+        img_size: Kích thước resize letterbox
+        chunk_size: Batch size khi forward ONNX
+        use_fp16: Lưu đặc trưng dạng float16
+        augmenter: Đối tượng DetectionAugmenter từ augment.py
+        num_aug: Số lượng biến thể augment cần tạo cho mỗi video (chỉ áp dụng khi augmenter != None)
+        include_original: Giữ lại video gốc bên cạnh các bản augment
+        base_seed: Seed cơ sở để tạo chuỗi seed ngẫu nhiên nhưng có tính lặp lại (reproducible)
+        force_recompute: Bắt buộc tính toán lại bỏ qua cache
     """
+    is_augmented_split = (augmenter is not None and num_aug > 0)
+    actual_include_original = include_original if is_augmented_split else True
+
     print(f"\n{'=' * 75}")
     print(f"[*] BẮT ĐẦU TRÍCH XUẤT ĐẶC TRƯNG CHO PHÂN TẬP: {split_name.upper()} ({len(items)} VIDEOS)")
+    if is_augmented_split:
+        aug_info = f"BẬT (Số bản augment={num_aug}, Giữ bản gốc={'Có' if actual_include_original else 'Không'})"
+    else:
+        aug_info = "TẮT (Chỉ trích xuất video gốc)"
+    print(f"[*] Tăng cường dữ liệu (Augmentation): {aug_info}")
     print(f"{'=' * 75}")
 
     split_cache_dir = cache_dir / split_name
     split_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    extracted_records = []
     p3_all, p4_all, p5_all = [], [], []
     labels_all, video_ids_all, seq_lens_all = [], [], []
 
@@ -376,48 +465,104 @@ def process_split_set(
     start_time = time.time()
     for idx, (video_path, label) in enumerate(tqdm(items, desc=f"[{split_name.upper()}]")):
         video_id = video_path.stem
-        cache_file = split_cache_dir / f"{video_id}.pt"
 
-        if cache_file.exists():
-            # Nạp từ cache đã trích xuất trước đó
-            cached_data = torch.load(cache_file, map_location="cpu")
-            p3 = cached_data["p3"]
-            p4 = cached_data["p4"]
-            p5 = cached_data["p5"]
-            actual_frames = cached_data.get("actual_frames", seq_len)
-        else:
+        # Xác định danh sách các biến thể cần xử lý cho video này
+        targets = []
+        if actual_include_original:
+            targets.append({
+                "sub_id": video_id,
+                "is_aug": False,
+                "aug_idx": 0,
+                "seed": None,
+            })
+
+        if is_augmented_split:
+            for k in range(1, num_aug + 1):
+                aug_id = f"{video_id}_aug{k}"
+                # Tạo seed xác định dựa trên base_seed và md5 hash của aug_id
+                aug_seed = (base_seed + int(hashlib.md5(aug_id.encode("utf-8")).hexdigest()[:8], 16)) % (2 ** 31 - 1)
+                targets.append({
+                    "sub_id": aug_id,
+                    "is_aug": True,
+                    "aug_idx": k,
+                    "seed": aug_seed,
+                })
+
+        # Kiểm tra xem những target nào chưa có trong cache
+        needed_targets = []
+        for t in targets:
+            cache_file = split_cache_dir / f"{t['sub_id']}.pt"
+            if force_recompute or not cache_file.exists():
+                needed_targets.append(t)
+
+        # Nếu cần trích xuất ít nhất một target, chỉ đọc và giải mã video một lần duy nhất
+        if len(needed_targets) > 0:
             try:
-                p3, p4, p5, actual_frames = extract_single_video_features(
+                raw_frames, actual_frames = read_and_sample_video_frames(
                     video_path=video_path,
-                    runner=runner,
                     seq_len=seq_len,
-                    img_size=img_size,
-                    chunk_size=chunk_size,
-                    device=f"cuda:{runner.device_id}"
+                    img_size=img_size
                 )
-                # Lưu cache cho từng video
-                torch.save({
-                    "video_id": video_id,
-                    "label": label,
-                    "p3": p3,
-                    "p4": p4,
-                    "p5": p5,
-                    "actual_frames": actual_frames
-                }, cache_file)
             except Exception as e:
-                print(f"\n[ERROR] Lỗi khi xử lý video {video_path.name}: {e}")
+                print(f"\n[ERROR] Lỗi khi đọc video {video_path.name}: {e}")
                 continue
 
-        p3_all.append(p3)
-        p4_all.append(p4)
-        p5_all.append(p5)
-        labels_all.append(label)
-        video_ids_all.append(video_id)
-        seq_lens_all.append(actual_frames)
+            for t in needed_targets:
+                try:
+                    if t["is_aug"]:
+                        aug_frames, _, _, _ = augmenter.augment_video(
+                            frames=raw_frames,
+                            boxes_list=None,
+                            labels_list=None,
+                            seed=t["seed"]
+                        )
+                        p3, p4, p5 = forward_video_chunks(
+                            frames_rgb=aug_frames,
+                            runner=runner,
+                            chunk_size=chunk_size,
+                            device=f"cuda:{runner.device_id}"
+                        )
+                    else:
+                        p3, p4, p5 = forward_video_chunks(
+                            frames_rgb=raw_frames,
+                            runner=runner,
+                            chunk_size=chunk_size,
+                            device=f"cuda:{runner.device_id}"
+                        )
+
+                    cache_file = split_cache_dir / f"{t['sub_id']}.pt"
+                    torch.save({
+                        "video_id": t["sub_id"],
+                        "label": label,
+                        "p3": p3,
+                        "p4": p4,
+                        "p5": p5,
+                        "actual_frames": actual_frames,
+                        "is_augmented": t["is_aug"],
+                        "aug_seed": t["seed"]
+                    }, cache_file)
+                except Exception as e:
+                    print(f"\n[ERROR] Lỗi khi xử lý mẫu {t['sub_id']}: {e}")
+
+        # Nạp dữ liệu từ cache cho tất cả targets của video này
+        for t in targets:
+            cache_file = split_cache_dir / f"{t['sub_id']}.pt"
+            if cache_file.exists():
+                cached_data = torch.load(cache_file, map_location="cpu")
+                p3_all.append(cached_data["p3"])
+                p4_all.append(cached_data["p4"])
+                p5_all.append(cached_data["p5"])
+                labels_all.append(cached_data["label"])
+                video_ids_all.append(cached_data["video_id"])
+                seq_lens_all.append(cached_data.get("actual_frames", seq_len))
 
     total_duration = time.time() - start_time
     print(
-        f"\n[+] Hoàn tất trích xuất {len(video_ids_all)} video tập {split_name} trong {total_duration / 60:.2f} phút!")
+        f"\n[+] Hoàn tất trích xuất {len(video_ids_all)} mẫu tập {split_name.upper()} trong {total_duration / 60:.2f} phút!")
+
+    if len(video_ids_all) == 0:
+        print(f"[WARN] Không có mẫu nào được trích xuất cho phân tập {split_name.upper()}!")
+        return
 
     # Đóng gói toàn bộ tensor 3D
     print(f"[+] Đang đóng gói Tensor cho tập {split_name}...")
@@ -433,6 +578,11 @@ def process_split_set(
         final_p4 = final_p4.half()
         final_p5 = final_p5.half()
 
+    num_alerts = (final_labels == 0).sum().item()
+    num_drowsy = (final_labels == 1).sum().item()
+    num_orig = sum(1 for vid in video_ids_all if "_aug" not in vid)
+    num_aug_count = sum(1 for vid in video_ids_all if "_aug" in vid)
+
     save_dict = {
         "p3": final_p3,
         "p4": final_p4,
@@ -441,7 +591,10 @@ def process_split_set(
         "video_ids": video_ids_all,
         "seq_lens": final_seq_lens,
         "dtype": "float16" if use_fp16 else "float32",
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "augmented": is_augmented_split,
+        "num_aug": num_aug if is_augmented_split else 0,
+        "include_original": actual_include_original,
     }
 
     output_pt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -450,10 +603,12 @@ def process_split_set(
     file_size_mb = output_pt_path.stat().st_size / (1024 * 1024)
     print(f"[SUCCESS] Đã lưu thành công tập {split_name.upper()} vào: {output_pt_path.resolve()}")
     print(f"          - Kích thước tệp: {file_size_mb:.2f} MB")
-    print(f"          - Tensor p3: {list(final_p3.shape)}")
-    print(f"          - Tensor p4: {list(final_p4.shape)}")
-    print(f"          - Tensor p5: {list(final_p5.shape)}")
-    print(f"          - Labels:    {list(final_labels.shape)}")
+    print(f"          - Tổng số mẫu:   {len(video_ids_all)} (Gốc: {num_orig}, Augment: {num_aug_count})")
+    print(f"          - Phân bố nhãn:  Tỉnh táo (0) = {num_alerts}, Buồn ngủ (1) = {num_drowsy}")
+    print(f"          - Tensor p3:     {list(final_p3.shape)}")
+    print(f"          - Tensor p4:     {list(final_p4.shape)}")
+    print(f"          - Tensor p5:     {list(final_p5.shape)}")
+    print(f"          - Labels:        {list(final_labels.shape)}")
 
 
 # ==============================================================================
@@ -481,6 +636,22 @@ def main():
     parser.add_argument("--limit", type=int, default=None,
                         help="Giới hạn số lượng video để chạy thử nghiệm (ví dụ: --limit 10)")
     parser.add_argument("--fp16", action="store_true", help="Lưu đặc trưng dạng float16 (giảm 50%% dung lượng)")
+
+    # Tham số tăng cường dữ liệu (Data Augmentation) từ augment.py
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
+                        help="Bật/tắt tăng cường dữ liệu từ augment.py (mặc định: True)")
+    parser.add_argument("--num_aug", type=int, default=1,
+                        help="Số bản sao tăng cường cho mỗi video trong tập áp dụng augment (mặc định: 1)")
+    parser.add_argument("--include_original", action=argparse.BooleanOptionalAction, default=True,
+                        help="Giữ lại video gốc bên cạnh các bản sao tăng cường (mặc định: True)")
+    parser.add_argument("--augment_splits", type=str, default="train",
+                        help="Các phân tập áp dụng tăng cường, phân cách bởi dấu phẩy (mặc định: train)")
+    parser.add_argument("--aug_seed", type=int, default=42,
+                        help="Random seed cơ sở cho việc tăng cường dữ liệu (mặc định: 42)")
+    parser.add_argument("--aug_config", type=str, default=None,
+                        help="Đường dẫn file JSON cấu hình augment tùy chỉnh (mặc định: dùng config mặc định từ augment.py)")
+    parser.add_argument("--force_recompute", action="store_true", default=False,
+                        help="Bắt buộc trích xuất lại từ đầu, bỏ qua cache hiện có")
     args = parser.parse_args()
 
     dataset_dir = Path(args.data_dir)
@@ -489,6 +660,7 @@ def main():
     cache_dir = output_dir / "cache"
 
     video_exts = tuple(ext.strip() for ext in args.video_exts.split(",") if ext.strip())
+    augment_splits = [s.strip().lower() for s in args.augment_splits.split(",") if s.strip()]
 
     split_json_path = output_dir / "dataset_split.json"
     train_pt_path = output_dir / args.train_name
@@ -504,6 +676,14 @@ def main():
     print(f"[*] Sequence Length   : {args.seq_len}")
     print(f"[*] Chunk Size        : {args.chunk_size}")
     print(f"[*] Precision         : {'Float16' if args.fp16 else 'Float32'}")
+    print(f"[*] Augmentation      : {'BẬT' if args.augment else 'TẮT'}")
+    if args.augment:
+        print(f"    - Augment Splits  : {augment_splits}")
+        print(f"    - Num Aug Copies  : {args.num_aug}")
+        print(f"    - Include Original: {args.include_original}")
+        print(f"    - Base Seed       : {args.aug_seed}")
+    if args.force_recompute:
+        print(f"[*] Force Recompute   : TRUE (Bỏ qua cache hiện có)")
     if args.limit:
         print(f"[*] TEST MODE         : Giới hạn xử lý {args.limit} video!")
     print("=" * 75)
@@ -527,7 +707,24 @@ def main():
     # 2. Khởi tạo ONNX Runtime
     runner = CloneONNXCUDARuntime(str(onnx_path), device_id=args.device_id)
 
-    # 3. Trích xuất tuần tự cho Train và Validation
+    # 3. Khởi tạo DetectionAugmenter nếu bật augmentation
+    augmenter = None
+    if args.augment and args.num_aug > 0 and len(augment_splits) > 0:
+        aug_cfg = dict(DEFAULT_AUG_CONFIG)
+        if args.aug_config:
+            aug_cfg_path = Path(args.aug_config)
+            if aug_cfg_path.exists():
+                with open(aug_cfg_path, "r", encoding="utf-8") as f:
+                    custom_cfg = json.load(f)
+                    aug_cfg.update(custom_cfg)
+                print(f"[+] Đã nạp cấu hình augment tùy chỉnh từ: {aug_cfg_path}")
+            else:
+                print(f"[WARN] Không tìm thấy file {aug_cfg_path}, dùng cấu hình mặc định từ augment.py")
+        augmenter = DetectionAugmenter(aug_cfg)
+        print(f"[+] Đã khởi tạo DetectionAugmenter với cấu hình:\n    {aug_cfg}")
+
+    # 4. Trích xuất tuần tự cho Train và Validation
+    should_augment_train = args.augment and ("train" in augment_splits)
     process_split_set(
         split_name="train",
         items=train_items,
@@ -537,9 +734,15 @@ def main():
         seq_len=args.seq_len,
         img_size=args.img_size,
         chunk_size=args.chunk_size,
-        use_fp16=args.fp16
+        use_fp16=args.fp16,
+        augmenter=augmenter if should_augment_train else None,
+        num_aug=args.num_aug if should_augment_train else 0,
+        include_original=args.include_original,
+        base_seed=args.aug_seed,
+        force_recompute=args.force_recompute
     )
 
+    should_augment_val = args.augment and ("val" in augment_splits)
     process_split_set(
         split_name="val",
         items=val_items,
@@ -549,7 +752,12 @@ def main():
         seq_len=args.seq_len,
         img_size=args.img_size,
         chunk_size=args.chunk_size,
-        use_fp16=args.fp16
+        use_fp16=args.fp16,
+        augmenter=augmenter if should_augment_val else None,
+        num_aug=args.num_aug if should_augment_val else 0,
+        include_original=args.include_original,
+        base_seed=args.aug_seed,
+        force_recompute=args.force_recompute
     )
 
     print("\n" + "=" * 75)

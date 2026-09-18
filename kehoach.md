@@ -448,7 +448,7 @@ logger.close()
 ```
 
 #### Cell 8: Đóng gói toàn bộ Checkpoint & TensorBoard Event Logs
-- Tự động nén toàn bộ thư mục `runs/` và model `best_lstm.pth` vào file zip `lstm_experiment_results.zip`.
+- Tự động nén toàn bộ thư mục `runs/` và model `best_lstm.pth` vào file zip `temp/lstm_experiment_results.zip`.
 - Giúp người dùng dễ dàng tải toàn bộ file nhật ký sự kiện về máy để mở lại TensorBoard bất kỳ lúc nào mà không bị mất dữ liệu khi tắt session Kaggle.
 
 ---
@@ -481,4 +481,4 @@ logger.close()
    - Nhận đầu vào là dataset `.pt` trên Kaggle.
    - Nạp dữ liệu qua `PreloadedTensorDataset`.
    - Huấn luyện `DeepLSTMClassifier` với AMP FP16.
-   - Bật giao diện TensorBoard nhúng trực tiếp và xuất kết quả `lstm_experiment_results.zip`.
+   - Bật giao diện TensorBoard nhúng trực tiếp và xuất kết quả `temp/lstm_experiment_results.zip`.

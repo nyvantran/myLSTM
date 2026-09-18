@@ -65,7 +65,7 @@ flowchart TD
 | **Cell 6** | `PreloadedTensorDataset`: nạp tensor `.pt` vào RAM trong < 0.5s, DataLoader batch 64 | [`dataset.py`](file:///D:/Project/AI/myLSTM/dataset.py), [`dataloader.py`](file:///D:/Project/AI/myLSTM/dataloader.py) | Chỉ có `MyLSTMDataset` đọc OpenCV video thô | Bổ sung `PreloadedTensorDataset` vào `dataset.py`, thêm hàm factory `get_tensor_dataloaders()` vào `dataloader.py` |
 | **Cell 7** | `DrowsinessLoss` (CrossEntropy trên chuỗi/frame cuối), AdamW, CosineAnnealingLR, AMP FP16, Vòng lặp Train/Val | [`loss.py`](file:///D:/Project/AI/myLSTM/loss.py), [`train.py`](file:///D:/Project/AI/myLSTM/train.py) | `loss.py` chỉ có `BCELoss`; `train.py` chưa có AMP và chạy chậm | Bổ sung `DrowsinessLoss` vào `loss.py`; Refactor toàn diện `train.py` với AMP FP16, Gradient Clipping, Cosine LR và lưu checkpoint |
 | **Cell 8** | Trực quan hóa đường cong Loss/Acc/F1, đánh giá Best Model Checkpoint với Confusion Matrix | [`train.py`](file:///D:/Project/AI/myLSTM/train.py), [`test.py`](file:///D:/Project/AI/myLSTM/test_model.ipynb) | Chưa có module đánh giá chuyên sâu độc lập | Tích hợp engine đánh giá vào cuối quá trình train và tạo script `test.py` kế thừa từ `test_model.ipynb` |
-| **Cell 9** | Đóng gói tự động `lstm_experiment_results.zip` | [`train.py`](file:///D:/Project/AI/myLSTM/train.py) | Chưa có | Bổ sung hàm tiện ích `export_experiment_results()` tự động nén `runs/` và `checkpoints/` |
+| **Cell 9** | Đóng gói tự động `temp/lstm_experiment_results.zip` | [`train.py`](file:///D:/Project/AI/myLSTM/train.py) | Chưa có | Bổ sung hàm tiện ích `export_experiment_results()` tự động nén `runs/` và `checkpoints/` |
 
 ---
 
