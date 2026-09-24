@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from pathlib import Path
@@ -39,12 +40,21 @@ class PreloadedTensorDataset(Dataset):
         print(f"[PreloadedTensorDataset] Đang nạp dữ liệu từ: {path.resolve()}...")
         data = torch.load(str(path), map_location="cpu")
 
-        # Ép kiểu float32 để đảm bảo tương thích tính toán trên mọi nền tảng
-        self.p3 = data["p3"].float()       # [N, 120, 224]
-        self.p4 = data["p4"].float()       # [N, 120, 448]
-        self.p5 = data["p5"].float()       # [N, 120, 640]
+        # Hỗ trợ cả dữ liệu chuỗi động List[torch.Tensor] (Cách 1) và Tensor 3D chữ nhật
+        self.is_variable_len = data.get("is_variable_len", isinstance(data["p3"], list))
+
+        if self.is_variable_len:
+            self.p3 = [t.float() for t in data["p3"]]
+            self.p4 = [t.float() for t in data["p4"]]
+            self.p5 = [t.float() for t in data["p5"]]
+        else:
+            self.p3 = data["p3"].float()       # [N, 120, 224]
+            self.p4 = data["p4"].float()       # [N, 120, 448]
+            self.p5 = data["p5"].float()       # [N, 120, 640]
+
         self.labels = data["labels"].long() # [N]
         self.video_ids = data.get("video_ids", [f"video_{i:04d}" for i in range(len(self.labels))])
+        self.seq_lens = data.get("seq_lens", None)
 
         load_sec = time.time() - t0
         print(f"    - Nạp hoàn tất {len(self.labels)} video vào RAM trong {load_sec:.2f}s!")
@@ -65,6 +75,10 @@ class MyLSTMDataset(Dataset):
     """
     Dataset tùy chỉnh PyTorch dùng để tải chuỗi khung hình video và nhãn cho mô hình Deep LSTM (Legacy Mode).
 
+    Quy tắc lấy mẫu (Temporal Sampling):
+    - Lấy mẫu theo chu kỳ thời gian cố định t (mặc định sample_interval = 0.5s): Cứ mỗi t giây lấy 1 khung hình.
+    - Đảm bảo tính nhất quán về độ phân giải thời gian giữa các video có thời lượng hoặc FPS khác nhau.
+
     Quy tắc gán nhãn:
     - Đọc tập tin video từ đường dẫn thư mục dataset.
     - Tách tên file theo ký tự '-': Thành phần thứ -2 xác định trạng thái của người lái xe:
@@ -75,7 +89,8 @@ class MyLSTMDataset(Dataset):
     def __init__(
             self,
             dataset_dir: str = TrainConfig.dataset_dir,
-            seq_len: int = TrainConfig.seq_len,
+            seq_len: Optional[int] = TrainConfig.seq_len,
+            sample_interval: float = 0.5,
             image_size: Tuple[int, int] = TrainConfig.image_size,
             transform: Optional[Callable] = None,
             video_exts: Sequence[str] = TrainConfig.video_exts
@@ -84,6 +99,7 @@ class MyLSTMDataset(Dataset):
 
         self.dataset_dir = Path(dataset_dir)
         self.seq_len = seq_len
+        self.sample_interval = max(float(sample_interval), 1e-4)  # Chu kỳ thời gian t (giây) giữa 2 lần lấy mẫu (mặc định 0.5s)
         self.image_size = image_size
         self.transform = transform
 
@@ -103,11 +119,18 @@ class MyLSTMDataset(Dataset):
             print(f"[MyLSTMDataset] Tìm thấy {len(self.video_paths)} file video trong {dataset_dir}")
 
     @classmethod
-    def from_config(cls, config: Any, transform: Optional[Callable] = None) -> "MyLSTMDataset":
+    def from_config(
+            cls,
+            config: Any,
+            transform: Optional[Callable] = None,
+            sample_interval: Optional[float] = None
+    ) -> "MyLSTMDataset":
         """Khởi tạo MyLSTMDataset trực tiếp từ đối tượng TrainConfig."""
+        interval = sample_interval if sample_interval is not None else getattr(config, "sample_interval", 0.5)
         return cls(
             dataset_dir=config.dataset_dir,
             seq_len=config.seq_len,
+            sample_interval=interval,
             image_size=config.image_size,
             transform=transform,
             video_exts=list(config.video_exts)
@@ -136,30 +159,62 @@ class MyLSTMDataset(Dataset):
                 f"Nhãn '{label_str}' trong {video_path.name} không nằm trong {list(self.label_map.keys())}")
 
     def _load_video_frames(self, video_path: Path) -> torch.Tensor:
-        """Đọc và trích xuất đều seq_len khung hình từ tập tin video qua OpenCV."""
+        """
+        Đọc và trích xuất khung hình từ tập tin video qua OpenCV theo chu kỳ thời gian t (sample_interval).
+        Cứ mỗi khoảng thời gian t (mặc định 0.5s) sẽ lấy 1 khung hình thay vì chia đều.
+        """
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
             raise RuntimeError(f"Không thể mở file video: {video_path}")
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        if fps <= 0 or math.isnan(fps) or math.isinf(fps):
+            fps = 30.0  # Mặc định 30 FPS nếu header không chứa thông tin hợp lệ
+
+        # Bước nhảy khung hình tương ứng với chu kỳ t giây
+        frame_step = self.sample_interval * fps
 
         frames = []
         if total_frames <= 0:
+            # Fallback đọc tuần tự nếu header không ghi tổng số frame
+            raw_frames = []
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(frame_rgb)
+                raw_frames.append(frame_rgb)
             cap.release()
-            total_frames = len(frames)
+            total_frames = len(raw_frames)
             if total_frames == 0:
                 raise ValueError(f"Video không chứa khung hình nào: {video_path}")
 
-            indices = torch.linspace(0, total_frames - 1, self.seq_len).long().tolist()
-            frames = [frames[i] for i in indices]
+            # Tính danh sách chỉ số khung hình tương ứng với từng mốc thời gian k * t
+            indices = []
+            k = 0
+            while True:
+                idx = int(round(k * frame_step))
+                if idx >= total_frames:
+                    break
+                indices.append(idx)
+                k += 1
+                if self.seq_len is not None and len(indices) >= self.seq_len:
+                    break
+
+            frames = [raw_frames[i] for i in indices]
         else:
-            indices = torch.linspace(0, total_frames - 1, self.seq_len).long().tolist()
+            # Tính danh sách chỉ số khung hình tương ứng với từng mốc thời gian k * t
+            indices = []
+            k = 0
+            while True:
+                idx = int(round(k * frame_step))
+                if idx >= total_frames:
+                    break
+                indices.append(idx)
+                k += 1
+                if self.seq_len is not None and len(indices) >= self.seq_len:
+                    break
 
             for idx in indices:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -172,16 +227,20 @@ class MyLSTMDataset(Dataset):
                     frames.append(blank_frame)
             cap.release()
 
-        while len(frames) < self.seq_len:
-            frames.append(frames[-1] if len(frames) > 0 else torch.zeros((self.image_size[0], self.image_size[1], 3),
-                                                                         dtype=torch.uint8).numpy())
-
-        frames = frames[:self.seq_len]
+        # Đảm bảo độ dài chuỗi cố định seq_len (nếu được cấu hình)
+        if self.seq_len is not None:
+            while len(frames) < self.seq_len:
+                frames.append(frames[-1] if len(frames) > 0 else torch.zeros((self.image_size[0], self.image_size[1], 3),
+                                                                             dtype=torch.uint8).numpy())
+            frames = frames[:self.seq_len]
 
         processed_frames = []
         for frame in frames:
             if self.transform is not None:
                 frame = self.transform(frame)[0]
+            elif (frame.shape[0], frame.shape[1]) != self.image_size:
+                frame = cv2.resize(frame, (self.image_size[1], self.image_size[0]))
+
             frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float() / 255.0
             processed_frames.append(frame_tensor)
 
